@@ -1,0 +1,35 @@
+
+# ========================================
+# 🔒 SENSITIVE CREDENTIALS - NEVER COMMIT!
+# ========================================
+credentials.json
+token.json
+.env
+.env.local
+.env.*.local
+
+# ========================================
+# Playwright Test Results
+# ========================================
+node_modules/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# ========================================
+# OS Files
+# ========================================
+.DS_Store
+Thumbs.db
+*.log
+
+# ========================================
+# IDE / Editor Files
+# ========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
