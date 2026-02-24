@@ -1,168 +1,120 @@
-/**
- * gmailOtpReader.js
- *
- * Reliable Gmail OTP reader for Playwright tests
- */
-
+// gmailOtpReader.js
 const { google } = require('googleapis');
 const fs = require('fs');
 const path = require('path');
 
-/* -------------------------------------------------------------------------
- * CONFIG
- * ---------------------------------------------------------------------- */
-
-const SCOPES = [
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.modify',
-];
-
-const CREDENTIALS_PATH =
-    process.env.GMAIL_CREDENTIALS_PATH || path.join(__dirname, 'credentials.json');
-
-const TOKEN_PATH =
-    process.env.GMAIL_TOKEN_PATH || path.join(__dirname, 'token.json');
+const CREDENTIALS_PATH = path.join(__dirname, 'credentials.json');
+const TOKEN_PATH = path.join(__dirname, 'token.json');
 
 let gmailClient;
 
-/* -------------------------------------------------------------------------
- * HELPERS
- * ---------------------------------------------------------------------- */
-
-function decodeBase64Url(str) {
-    const padded =
-        str.replace(/-/g, '+').replace(/_/g, '/') +
-        '='.repeat((4 - (str.length % 4)) % 4);
-
-    return Buffer.from(padded, 'base64').toString('utf8');
-}
-
-function extractText(payload) {
-    if (payload.mimeType === 'text/plain' && payload.body?.data) {
-        return decodeBase64Url(payload.body.data);
-    }
-
-    if (payload.parts) {
-        for (const part of payload.parts) {
-            const text = extractText(part);
-            if (text) return text;
-        }
-    }
-
-    if (payload.mimeType === 'text/html' && payload.body?.data) {
-        return decodeBase64Url(payload.body.data).replace(/<[^>]+>/g, ' ');
-    }
-
-    return null;
-}
-
-function buildQuery({ query = '', maxAgeMinutes }) {
-    const parts = [];
-
-    if (query) parts.push(query.trim());
-    if (maxAgeMinutes) parts.push(`newer_than:${maxAgeMinutes}m`);
-
-    return parts.join(' ');
-}
-
-/* -------------------------------------------------------------------------
- * PUBLIC API
- * ---------------------------------------------------------------------- */
-
+/* =========================================================
+INITIALIZE GMAIL API
+========================================================= */
 async function initializeGmailAPI() {
     if (!fs.existsSync(CREDENTIALS_PATH)) {
-        throw new Error(`Missing credentials.json at ${CREDENTIALS_PATH}`);
+        throw new Error(`credentials.json not found at ${CREDENTIALS_PATH}`);
     }
+
     if (!fs.existsSync(TOKEN_PATH)) {
-        throw new Error(`Missing token.json at ${TOKEN_PATH}`);
+        throw new Error(`token.json not found at ${TOKEN_PATH}`);
     }
 
     const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
     const { client_id, client_secret, redirect_uris } =
         credentials.installed || credentials.web;
 
-    const auth = new google.auth.OAuth2(
+    const oAuth2Client = new google.auth.OAuth2(
         client_id,
         client_secret,
         redirect_uris[0]
     );
 
     const token = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
-    auth.setCredentials(token);
+    oAuth2Client.setCredentials(token);
 
-    auth.on('tokens', (tokens) => {
-        if (tokens.refresh_token) token.refresh_token = tokens.refresh_token;
-        if (tokens.access_token) token.access_token = tokens.access_token;
-        if (tokens.expiry_date) token.expiry_date = tokens.expiry_date;
-        fs.writeFileSync(TOKEN_PATH, JSON.stringify(token, null, 2));
-        console.log('[gmail] Token refreshed');
+    gmailClient = google.gmail({
+        version: 'v1',
+        auth: oAuth2Client,
     });
 
-    gmailClient = google.gmail({ version: 'v1', auth });
-    console.log('[gmail] Gmail API ready');
+    console.log('Gmail API initialized successfully');
 }
 
+/* =========================================================
+FETCH OTP FROM GMAIL
+========================================================= */
 async function getOtpFromGmail({
-    query = 'OTP',
-    maxAgeMinutes = 10,
-    maxRetries = 40,
+    maxRetries = 10,
     retryDelay = 3000,
-    otpRegex = /(\d{6})/,
-    markAsRead = true,
+    maxAgeMinutes = 5,
 } = {}) {
     if (!gmailClient) {
-        throw new Error('Gmail API not initialized');
+        throw new Error('Gmail API not initialized. Call initializeGmailAPI() first.');
     }
 
-    const finalQuery = buildQuery({ query, maxAgeMinutes });
-
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        console.log(
-            `[gmail] Attempt ${attempt}/${maxRetries} – query: "${finalQuery}"`
-        );
+        console.log(`Attempt ${attempt}/${maxRetries}`);
 
-        const listRes = await gmailClient.users.messages.list({
+        // 🔎 Only search recent unread OTP emails
+        const response = await gmailClient.users.messages.list({
             userId: 'me',
-            q: finalQuery,
-            maxResults: 20,
-            includeSpamTrash: true,
+            q: `is:unread newer_than:${maxAgeMinutes}m`,
+            maxResults: 5,
         });
 
-        const messages = listRes.data.messages || [];
-        console.log(`[gmail] Found ${messages.length} messages`);
+        const messages = response?.data?.messages;
+        if (!messages || messages.length === 0) {
+            console.log('No OTP email found yet...');
+            await delay(retryDelay);
+            
+            continue;
+        }
 
-        for (const { id } of messages) {
-            const msg = await gmailClient.users.messages.get({
+        for (const msg of messages) {
+            const message = await gmailClient.users.messages.get({
                 userId: 'me',
-                id,
-                format: 'full',
+                id: msg.id,
             });
 
-            const payload = msg.data.payload;
-            const body = extractText(payload);
-            if (!body) continue;
+            const headers = message.data.payload.headers;
+            const subjectHeader = headers.find(h => h.name === 'Subject');
+            const subject = subjectHeader ? subjectHeader.value : '';
 
-            const match = body.match(otpRegex);
-            if (match) {
-                const otp = match[1];
-                console.log(`[gmail] ✅ OTP FOUND: ${otp}`);
+            console.log(`[INFO] Checking email: ${subject}`);
 
-                if (markAsRead) {
-                    await gmailClient.users.messages.modify({
-                        userId: 'me',
-                        id,
-                        requestBody: { removeLabelIds: ['UNREAD'] },
-                    });
-                }
+            // Extract exactly 6-digit OTP from subject
+            const otpMatch = subject.match(/\b\d{6}\b/);
+
+            if (otpMatch) {
+                const otp = otpMatch[0];
+
+                console.log(`OTP FOUND: ${otp}`);
+
+                // Mark email as read (very important for stability)
+                await gmailClient.users.messages.modify({
+                    userId: 'me',
+                    id: msg.id,
+                    requestBody: {
+                        removeLabelIds: ['UNREAD'],
+                    },
+                });
 
                 return otp;
             }
         }
 
-        await new Promise((r) => setTimeout(r, retryDelay));
+        await delay(retryDelay);
     }
 
-    throw new Error('OTP not received after maximum retries');
+    throw new Error('OTP not received within time limit');
+}
+
+/* =========================================================
+HELPER FUNCTION
+========================================================= */
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 module.exports = {
