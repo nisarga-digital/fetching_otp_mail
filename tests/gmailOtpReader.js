@@ -63,8 +63,7 @@ async function getOtpFromGmail({
             maxResults: 5,
         });
 
-        const messages = response.data.messages;
-
+        const messages = response?.data?.messages;
         if (!messages || messages.length === 0) {
             console.log('No OTP email found yet...');
             await delay(retryDelay);
